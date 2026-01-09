@@ -7,4 +7,3 @@ build
 .publish
 .DS_Store
 .gqs~
-package-lock.json
