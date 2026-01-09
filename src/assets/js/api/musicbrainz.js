@@ -6,9 +6,47 @@ api.musicbrainz = (function() {
 	var lastRequestTime = 0;
 	var MIN_REQUEST_INTERVAL = 1000; // 1 second minimum between requests
 	
-	// CORS proxy - set to empty string to disable, or provide a proxy URL
-	// Example: "https://cors-anywhere.herokuapp.com/" or your own proxy
-	var CORS_PROXY = ""; // Empty = no proxy (will fail due to CORS)
+	// Mapping for common subdivisions to countries
+	var subdivisionToCountry = {
+		"England": "United Kingdom",
+		"Scotland": "United Kingdom",
+		"Wales": "United Kingdom",
+		"Northern Ireland": "United Kingdom"
+	};
+	
+	/**
+	 * Extract country name from artist data
+	 * @param {Object} artistData - Artist data from MusicBrainz API
+	 * @returns {Object} Object with countryName and areaName, or null if not found
+	 */
+	function extractCountryName(artistData) {
+		var countryName = null;
+		var areaName = null;
+		
+		// Check area field first
+		if (artistData.area) {
+			if (artistData.area.type === "Country" && artistData.area.name) {
+				countryName = artistData.area.name;
+				areaName = artistData.area.name;
+			} else if (artistData.area.type === "Subdivision" && artistData.area.name) {
+				countryName = subdivisionToCountry[artistData.area.name];
+				areaName = artistData.area.name;
+			}
+		}
+		
+		// Check begin-area if area didn't work
+		if (!countryName && artistData["begin-area"]) {
+			if (artistData["begin-area"].type === "Country" && artistData["begin-area"].name) {
+				countryName = artistData["begin-area"].name;
+				areaName = artistData["begin-area"].name;
+			} else if (artistData["begin-area"].type === "Subdivision" && artistData["begin-area"].name) {
+				countryName = subdivisionToCountry[artistData["begin-area"].name];
+				areaName = artistData["begin-area"].name;
+			}
+		}
+		
+		return countryName ? { countryName: countryName, areaName: areaName } : null;
+	}
 	
 	/**
 	 * Get country for an artist from MusicBrainz API
@@ -16,24 +54,15 @@ api.musicbrainz = (function() {
 	 * @param {Function} callback - Callback function with result object
 	 */
 	function getCountry(artist, callback) {
-		// Use HTTPS to avoid mixed content issues
-		// Include 'inc=area-rels' to get area information with ISO codes
-		var url = "https://musicbrainz.org/ws/2/artist/?query=artist:" + encodeURIComponent(artist) + "&fmt=json&limit=1&inc=area-rels";
+		var url = "https://musicbrainz.org/ws/2/artist/?query=artist:" + encodeURIComponent(artist) + "&fmt=json&limit=1";
 		
-		// Use fetch API instead of XMLHttpRequest
-		// Note: User-Agent is a forbidden header in fetch, so we can't set it from browser
-		// MusicBrainz requires User-Agent but browsers will ignore it in fetch requests
-		try {
-			fetch(url, {
-				method: 'GET',
-				headers: {
-					'Accept': 'application/json'
-				},
-				mode: 'cors' // Explicitly set CORS mode
-			})
-			.then(function(response) {
-				// Check response type - if it's 'opaque' or 'opaqueredirect', CORS failed
-				if (response.type === 'opaque' || response.type === 'opaqueredirect') {
+		// Use XMLHttpRequest for consistency with rest of codebase and better abort support
+		var xhr = new XMLHttpRequest();
+		
+		xhr.onreadystatechange = function() {
+			if (xhr.readyState === 4) {
+				// Check for CORS error (status 0 typically indicates CORS failure)
+				if (xhr.status === 0) {
 					callback({
 						artist: artist,
 						error: "cors_error"
@@ -41,14 +70,17 @@ api.musicbrainz = (function() {
 					return;
 				}
 				
-				if (!response.ok) {
-					if (response.status === 503) {
-						callback({
-							artist: artist,
-							error: "rate_limit"
-						});
-						return;
-					}
+				// Check for rate limit
+				if (xhr.status === 503) {
+					callback({
+						artist: artist,
+						error: "rate_limit"
+					});
+					return;
+				}
+				
+				// Check for other HTTP errors
+				if (xhr.status < 200 || xhr.status >= 300) {
 					callback({
 						artist: artist,
 						error: "api_error"
@@ -56,21 +88,19 @@ api.musicbrainz = (function() {
 					return;
 				}
 				
-				return response.json().catch(function(jsonError) {
+				// Parse JSON response
+				var data;
+				try {
+					data = JSON.parse(xhr.responseText);
+				} catch (e) {
 					callback({
 						artist: artist,
 						error: "parse_error"
 					});
-					throw jsonError; // Re-throw to stop the chain
-				});
-			})
-			.then(function(data) {
-				if (!data) {
-					// Already handled error case or undefined from catch
 					return;
 				}
 				
-				// Parse response
+				// Check if we got valid artist data
 				if (!data || !data.artists || !data.artists.length) {
 					callback({
 						artist: artist,
@@ -78,84 +108,64 @@ api.musicbrainz = (function() {
 					});
 					return;
 				}
-			
-			// Get first artist result
-			var artistData = data.artists[0];
-			
-			// Extract country name from area field
-			var countryName = null;
-			var areaName = null;
-			
-			// Mapping for common subdivisions to countries
-			var subdivisionToCountry = {
-				"England": "United Kingdom",
-				"Scotland": "United Kingdom",
-				"Wales": "United Kingdom",
-				"Northern Ireland": "United Kingdom"
-			};
-			
-			// Check if area exists and is a Country type
-			if (artistData.area && artistData.area.type === "Country" && artistData.area.name) {
-				countryName = artistData.area.name;
-				areaName = artistData.area.name;
-			}
-			// Check if area is a Subdivision that we can map to a country
-			else if (artistData.area && artistData.area.type === "Subdivision" && artistData.area.name) {
-				countryName = subdivisionToCountry[artistData.area.name];
-				areaName = artistData.area.name;
-			}
-			// Check begin-area if area didn't work
-			else if (artistData["begin-area"] && artistData["begin-area"].type === "Country" && artistData["begin-area"].name) {
-				countryName = artistData["begin-area"].name;
-				areaName = artistData["begin-area"].name;
-			}
-			// Check if begin-area is a Subdivision that we can map
-			else if (artistData["begin-area"] && artistData["begin-area"].type === "Subdivision" && artistData["begin-area"].name) {
-				countryName = subdivisionToCountry[artistData["begin-area"].name];
-				areaName = artistData["begin-area"].name;
-			}
-			
-			if (countryName) {
-				// Return the country name
-				callback({
-					artist: artist,
-					countryName: countryName,
-					area: areaName
-				});
-			} else {
-				callback({
-					artist: artist,
-					error: "no_country"
-				});
-			}
-			})
-			.catch(function(error) {
-				// Catch any errors in the promise chain
-				// Check if it's a CORS/network error
-				if (error && error.name === 'TypeError' && (error.message.includes('Failed to fetch') || error.message.includes('NetworkError'))) {
+				
+				// Get first artist result
+				var artistData = data.artists[0];
+				
+				// Extract country name from artist data
+				var countryInfo = extractCountryName(artistData);
+				
+				if (countryInfo) {
 					callback({
 						artist: artist,
-						error: "cors_error"
+						countryName: countryInfo.countryName,
+						area: countryInfo.areaName
 					});
 				} else {
 					callback({
 						artist: artist,
-						error: "api_error"
+						error: "no_country"
 					});
 				}
+			}
+		};
+		
+		xhr.onerror = function() {
+			// Network error or CORS error (only fires if status is still 0)
+			// onreadystatechange will handle status 0, so this is a fallback
+			if (xhr.readyState === 4 && xhr.status === 0) {
+				callback({
+					artist: artist,
+					error: "cors_error"
+				});
+			}
+		};
+		
+		xhr.ontimeout = function() {
+			callback({
+				artist: artist,
+				error: "api_error"
 			});
-		} catch (syncError) {
-			// Catch any synchronous errors
+		};
+		
+		try {
+			xhr.open("GET", url, true);
+			xhr.setRequestHeader("Accept", "application/json");
+			xhr.timeout = 20000; // 20 second timeout
+			xhr.send();
+		} catch (e) {
 			callback({
 				artist: artist,
 				error: "api_error"
 			});
 		}
 		
-		// Return a mock abort function for compatibility
+		// Return abort function for compatibility
 		return {
 			abort: function() {
-				// Fetch doesn't have a simple abort in older browsers, but we can't easily cancel here
+				if (xhr.readyState !== 4 && xhr.readyState !== 0) {
+					xhr.abort();
+				}
 			}
 		};
 	}
